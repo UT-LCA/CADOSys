@@ -10,6 +10,7 @@ To compile the project, run:
 
 ```bash
 make
+export CADOSys_ROOT=$PWD
 ```
 
 ## Example Scripts

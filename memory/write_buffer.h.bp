@@ -1,0 +1,255 @@
+#ifndef _write_buffer_h
+#define _write_buffer_h
+
+#include <xtensor/xarray.hpp>
+#include <xtensor/xio.hpp>
+#include <xtensor/xview.hpp>
+
+#include "llc.h"
+
+class WriteBuffer
+{
+public:
+    WriteBuffer();
+    void set_params(LLC *llc, int64_t total_size_bytes, int64_t word_size, float active_buf_frac, int64_t req_gen_bandwidth);
+    xt::xarray<int64_t> service_writes(xt::xarray<int64_t> incoming_requests_arr_np, xt::xarray<int64_t> incoming_cycles_arr, int llc_partition, bool trans);
+    int64_t service_write(xt::xarray<int64_t> incoming_requests_arr_np, int64_t incoming_cycle, int llc_partition, bool trans);
+    void store_to_trace_mat_cache(int64_t addr);
+    void append_to_trace_mat(bool force);
+    int64_t empty_drain_buf(int64_t empty_start_cycle, int llc_partition);
+
+private:
+    LLC *llc;
+    int64_t total_size_bytes;
+    int64_t word_size;
+    float active_buf_frac;
+    int64_t req_gen_bandwidth;
+
+    int64_t hit_latency;
+
+    int64_t total_size_elems;
+    int64_t active_buf_size;
+    int64_t drain_buf_size;
+    int64_t free_space;
+
+    int64_t drain_buf_start_line_id;
+    int64_t drain_buf_end_line_id;
+
+    int64_t col_idx;
+    int64_t line_idx;
+    xt::xarray<int64_t> current_line;
+    int64_t max_cache_lines;
+    xt::xarray<int64_t> trace_matrix_cache;
+
+    int64_t num_access;
+    int64_t state;
+    int64_t drain_end_cycle;
+
+    bool trans;
+
+    bool trace_valid;
+    bool trace_matrix_cache_empty;
+    bool trace_matrix_empty;
+};
+
+WriteBuffer::WriteBuffer()
+{
+    total_size_bytes = 128;
+    word_size = 1;
+    active_buf_frac = 0.9;
+    hit_latency = 1;
+
+    total_size_elems = total_size_bytes / word_size;
+    active_buf_size = (int64_t)(total_size_elems * active_buf_frac);
+    drain_buf_size = total_size_elems - active_buf_size;
+    free_space = total_size_elems;
+
+    req_gen_bandwidth = 32;
+
+    col_idx = 0;
+    line_idx = 0;
+    max_cache_lines = total_size_elems / req_gen_bandwidth;
+
+    state = 0;
+    drain_end_cycle = 0;
+
+    trace_valid = false;
+    trace_matrix_cache_empty = true;
+    trace_matrix_empty = true;
+
+    drain_buf_start_line_id = 0;
+    drain_buf_end_line_id = 0;
+
+    current_line = xt::ones<int64_t>({1}) * -1;
+    trace_matrix_cache = xt::zeros<int64_t>({1, 1});
+}
+
+void WriteBuffer::set_params(LLC *llc, int64_t total_size_bytes, int64_t word_size, float active_buf_frac, int64_t req_gen_bandwidth)
+{
+    this->llc = llc;
+    this->word_size = word_size;
+    this->active_buf_frac = active_buf_frac;
+    this->req_gen_bandwidth = req_gen_bandwidth;
+
+    total_size_elems = total_size_bytes / word_size;
+    active_buf_size = (int64_t)(total_size_elems * active_buf_frac);
+    drain_buf_size = total_size_elems - active_buf_size;
+    free_space = total_size_elems;
+
+    max_cache_lines = total_size_elems / req_gen_bandwidth;
+    trace_matrix_cache = xt::ones<int64_t>({(int)max_cache_lines, (int)req_gen_bandwidth}) * -1;
+}
+
+void WriteBuffer::store_to_trace_mat_cache(int64_t addr)
+{
+    if (addr == -1)
+        return;
+
+    if (current_line.shape()[0] == 1)
+        current_line = xt::ones<int64_t>({(int)req_gen_bandwidth}) * -1;
+
+    current_line(line_idx++) = addr;
+    free_space--;
+
+    if (line_idx >= req_gen_bandwidth)
+    {
+        xt::row(trace_matrix_cache, col_idx) = current_line;
+
+        line_idx = 0;
+        col_idx = (col_idx + 1) % max_cache_lines;
+    }
+}
+
+xt::xarray<int64_t> WriteBuffer::service_writes(xt::xarray<int64_t> incoming_requests_arr_np, xt::xarray<int64_t> incoming_cycles_arr, int llc_partition, bool trans)
+{
+    this->trans = trans;
+
+    xt::xarray<int64_t> out_cycles_arr = xt::zeros<int64_t>({incoming_requests_arr_np.shape()[0]});
+    int64_t offset = 0;
+
+    for (int64_t i = 0; i < incoming_requests_arr_np.shape()[0]; i++)
+    {
+        int64_t cycle = incoming_cycles_arr(i);
+        int64_t current_cycle = cycle + offset;
+        xt::xarray<int64_t> request_line = xt::row(incoming_requests_arr_np, i);
+
+        for (int64_t addr : request_line)
+        {
+            if (addr == -1)
+                continue;
+
+            if (free_space > 0)
+            {
+                store_to_trace_mat_cache(addr);
+            }
+            else
+            {
+                if (current_cycle < drain_end_cycle)
+                {
+                    offset += max(drain_end_cycle - current_cycle, (int64_t)0);
+                    current_cycle = drain_end_cycle;
+                }
+                drain_end_cycle = empty_drain_buf(current_cycle, llc_partition);
+            }
+
+            if (free_space <= (total_size_elems - drain_buf_size))
+            {
+                if (current_cycle < drain_end_cycle)
+                {
+                    offset += max(drain_end_cycle - current_cycle, (int64_t)0);
+                    current_cycle = drain_end_cycle;
+                }
+                drain_end_cycle = empty_drain_buf(current_cycle, llc_partition);
+            }
+        }
+        out_cycles_arr(i) = current_cycle;
+    }
+    return out_cycles_arr;
+}
+
+
+int64_t WriteBuffer::service_write(xt::xarray<int64_t> request_line, int64_t incoming_cycle, int llc_partition, bool trans)
+{
+    this->trans = trans;
+
+    int64_t offset = 0;
+
+    int64_t cycle = incoming_cycle;
+    int64_t current_cycle = cycle + offset;
+
+    for (int64_t addr : request_line)
+    {
+        if (addr == -1)
+            continue;
+
+        if (free_space > 0)
+        {
+            store_to_trace_mat_cache(addr);
+        }
+        else
+        {
+            if (current_cycle < drain_end_cycle)
+            {
+                offset += max(drain_end_cycle - current_cycle, (int64_t)0);
+                current_cycle = drain_end_cycle;
+            }
+            drain_end_cycle = empty_drain_buf(current_cycle, llc_partition);
+        }
+
+        if (free_space <= (total_size_elems - drain_buf_size))
+        {
+            if (current_cycle < drain_end_cycle)
+            {
+                offset += max(drain_end_cycle - current_cycle, (int64_t)0);
+                current_cycle = drain_end_cycle;
+            }
+            drain_end_cycle = empty_drain_buf(current_cycle, llc_partition);
+        }
+    }
+    int64_t out_cycles_arr = current_cycle;
+
+    return out_cycles_arr;
+}
+
+
+int64_t WriteBuffer::empty_drain_buf(int64_t empty_start_cycle, int llc_partition)
+{
+    int64_t lines_to_fill_dbuf = (drain_buf_size + req_gen_bandwidth - 1) / req_gen_bandwidth;
+    drain_buf_end_line_id = (drain_buf_start_line_id + lines_to_fill_dbuf) % max_cache_lines;
+
+    xt::xarray<int64_t> requests_arr_np;
+    if (drain_buf_end_line_id > lines_to_fill_dbuf)
+        requests_arr_np = xt::view(trace_matrix_cache, xt::range(drain_buf_start_line_id, drain_buf_end_line_id), xt::all());
+    else
+    {
+        requests_arr_np = xt::concatenate(xtuple(
+                                              xt::view(trace_matrix_cache, xt::range(drain_buf_start_line_id, max_cache_lines), xt::all()),
+                                              xt::view(trace_matrix_cache, xt::range(0, drain_buf_end_line_id), xt::all())),
+                                          0);
+    }
+
+    if (trans)
+        requests_arr_np = xt::transpose(requests_arr_np);
+
+    int num_lines = requests_arr_np.shape()[0];
+
+    int data_sz_to_drain = num_lines * requests_arr_np.shape()[1];
+    num_access += data_sz_to_drain;
+
+    xt::xarray<int64_t> cycles_arr({num_lines});
+
+    for (int x = 0; x < num_lines; x++)
+    {
+        cycles_arr[x] = empty_start_cycle + x;
+    }
+
+    xt::xarray<int64_t> serviced_cycles_arr = llc->service_writes(requests_arr_np, cycles_arr, llc_partition);
+
+    int64_t service_end_cycle = serviced_cycles_arr(-1);
+    free_space += data_sz_to_drain;
+
+    drain_buf_start_line_id = drain_buf_end_line_id;
+    return service_end_cycle;
+}
+
+#endif

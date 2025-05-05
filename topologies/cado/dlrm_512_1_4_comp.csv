@@ -1,0 +1,11 @@
+Layer name,Layer Type,IFMAP Height,IFMAP Width,Filter Height,Filter Width,Channels,Num Filter,Stride Height,Stride Width,IFMAP Source,Filter Source,PE,Dataflow
+Emb0,0,1024,1,1,1,16,4,1,1,-1,-1,0,ws
+Emb1,0,1024,1,1,1,16,3,1,1,-1,-1,0 ,ws
+Emb2,0,1024,1,1,1,16,2,1,1,-1,-1,0 ,ws
+Bot_MLP0,0,1024,1,1,1,13,512,1,1,-1,-1,0 ,ws
+Bot_MLP1,0,1024,1,1,1,512,256,1,1,3,-1,0 ,ws
+Bot_MLP2,0,1024,1,1,1,256,64,1,1,4,-1,0 ,ws
+Bot_MLP3,0,1024,1,1,1,64,16,1,1,5,-1,0 ,ws
+Top_MLP0,0,1024,1,1,1,25,512,1,1,0_1_2_6,-1,0 ,os
+Top_MLP1,0,1024,1,1,1,512,256,1,1,7,-1,0 ,ws
+Top_MLP2,0,1024,1,1,1,256,1,1,1,8,-1,0 ,is

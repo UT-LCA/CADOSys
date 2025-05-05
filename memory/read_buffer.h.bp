@@ -1,0 +1,394 @@
+#ifndef _read_buffer_h
+#define _read_buffer_h
+
+#include <xtensor/xarray.hpp>
+#include <xtensor/xio.hpp>
+#include <xtensor/xview.hpp>
+
+#include <vector>
+#include <unordered_set>
+
+using namespace std;
+
+#include "llc.h"
+
+class ReadBuffer {
+public:
+    ReadBuffer();
+    void set_params(LLC* llc, int64_t total_size_bytes, int64_t word_size, float active_buf_frac, int64_t req_gen_bandwidth);
+    void set_fetch_matrix(xt::xarray<int64_t> fetch_matrix_np);
+    xt::xarray<int64_t> service_reads(xt::xarray<int64_t> incoming_requests_arr_np, xt::xarray<int64_t> incoming_cycles_arr);
+    int64_t get_hit_latency() {return hit_latency; }
+private:
+    LLC *llc;
+    int64_t total_size_bytes;
+    int64_t word_size; 
+    float active_buf_frac;
+    int64_t req_gen_bandwidth;
+
+    xt::xarray<int64_t> fetch_matrix;
+    int64_t last_prefect_cycle;
+    int64_t next_line_prefetch_idx;
+    int64_t next_col_prefetch_idx;
+
+    int64_t hit_latency;
+    int64_t num_lines;
+    int64_t num_active_buf_lines;
+    int64_t num_prefetch_buf_lines;
+    pair<int64_t, int64_t> active_buffer_set_limits;
+    pair<int64_t, int64_t> prefetch_buffer_set_limits;
+
+    int64_t total_size_elems;
+    int64_t active_buf_size;
+    int64_t prefetch_buf_size;
+
+    int64_t num_access;
+
+    bool active_buf_full_flag = false;
+    bool hashed_buffer_valid = false;
+    bool trace_valid = false;
+
+    vector<unordered_set<int64_t>*> hashed_buffer;
+
+    void prepare_hashed_buffer();
+    void prefetch_active_buffer(int64_t start_cycle);
+    bool active_buffer_hit(int64_t addr);
+    void new_prefetch();
+};
+
+ReadBuffer::ReadBuffer() {
+    total_size_bytes = 128;
+    word_size = 1;
+    active_buf_frac = 0.9;
+    hit_latency = 1;
+
+    num_lines = 0;
+    num_active_buf_lines = 1;
+    num_prefetch_buf_lines = 1;
+    num_access = 0;
+
+    last_prefect_cycle = -1;
+
+    total_size_elems = total_size_bytes / word_size;
+    active_buf_size = (int64_t) (total_size_elems * active_buf_frac);
+    prefetch_buf_size = total_size_elems - active_buf_size;
+}
+
+void ReadBuffer::set_params(LLC* llc, int64_t total_size_bytes, int64_t word_size, float active_buf_frac, int64_t req_gen_bandwidth) {
+    this->llc = llc;
+    this->word_size = word_size;
+    this->active_buf_frac = active_buf_frac;
+    this->req_gen_bandwidth = req_gen_bandwidth;
+
+    total_size_elems = total_size_bytes / word_size;
+    active_buf_size = (int64_t) (total_size_elems * active_buf_frac);
+    prefetch_buf_size = total_size_elems - active_buf_size;
+}
+
+void ReadBuffer::set_fetch_matrix(xt::xarray<int64_t> fetch_matrix_np) {
+    int64_t num_elems = fetch_matrix_np.shape()[0] * fetch_matrix_np.shape()[1];
+    int64_t num_lines = (num_elems + req_gen_bandwidth - 1) / req_gen_bandwidth;
+    cout << num_elems << ", " << num_lines << endl;
+    cout << num_lines << ", " << req_gen_bandwidth << endl;
+    fetch_matrix = xt::ones<int64_t>({num_lines, req_gen_bandwidth}) * -1;
+
+    for (int64_t i = 0; i < num_elems; i++) {
+        int64_t src_row = i / fetch_matrix_np.shape()[1];
+        int64_t src_col = i % fetch_matrix_np.shape()[1];
+
+        int64_t dest_row = i / req_gen_bandwidth;
+        int64_t dest_col = i % req_gen_bandwidth;
+
+        // cout << src_row << ", " << src_col << endl;
+        // cout << dest_row << ", " << dest_col << endl;
+
+        fetch_matrix(dest_row, dest_col) = fetch_matrix_np(src_row, src_col);
+    }
+
+    prepare_hashed_buffer();
+}
+
+void ReadBuffer::prepare_hashed_buffer() {
+    // int64_t elems_per_set = (total_size_elems + 99) / 100;
+    int64_t elems_per_set = 512;
+
+    int64_t prefetch_rows = fetch_matrix.shape()[0];
+    int64_t prefetch_cols = fetch_matrix.shape()[1];
+
+    int64_t line_id = 0;
+    int64_t elem_ctr = 0;
+
+    unordered_set<int64_t> *this_set = new unordered_set<int64_t>(elems_per_set);
+    hashed_buffer.push_back(this_set);
+        
+    for (int64_t r = 0; r < prefetch_rows; r++) {
+        for (int64_t c = 0; c < prefetch_cols; c++) {
+            int64_t elem = fetch_matrix(r, c);
+
+            // if (elem != -1) {
+                hashed_buffer[line_id]->insert(elem);
+                elem_ctr += 1;
+            // }
+
+            if (elem_ctr >= elems_per_set) {
+                unordered_set<int64_t> *this_set = new unordered_set<int64_t>(elems_per_set);
+                hashed_buffer.push_back(this_set);
+                line_id += 1;
+                elem_ctr = 0;
+            }
+        }
+    }
+
+    int64_t max_num_active_buf_lines = (active_buf_size + elems_per_set - 1) / elems_per_set;
+    int64_t max_num_prefetch_buf_lines = (prefetch_buf_size + elems_per_set - 1) / elems_per_set;
+    int64_t num_lines = line_id + 1;
+        
+    if (num_lines > max_num_active_buf_lines)
+        num_active_buf_lines = max_num_active_buf_lines;
+    else
+        num_active_buf_lines = num_lines;
+
+    int64_t remaining_lines = num_lines - num_active_buf_lines;
+
+    if (remaining_lines > max_num_prefetch_buf_lines)
+        num_prefetch_buf_lines = max_num_prefetch_buf_lines;
+    else
+        num_prefetch_buf_lines = remaining_lines;
+
+    this->num_lines = num_lines;
+    hashed_buffer_valid = true;
+}
+
+bool ReadBuffer::active_buffer_hit(int64_t addr) {
+    int64_t start_id = active_buffer_set_limits.first;
+    int64_t end_id = active_buffer_set_limits.second;
+
+    // cout << start_id << ", " << end_id << endl;
+
+    if (start_id < end_id) {
+        for (int line_id = start_id; line_id < end_id; line_id++) {
+            unordered_set<int64_t> *this_set = hashed_buffer[line_id];
+            if (this_set->find(addr) != this_set->end())                       
+                return true;
+        }        
+    } else {
+        for (int line_id = start_id; line_id < num_lines; line_id++) {
+            unordered_set<int64_t> *this_set = hashed_buffer[line_id];
+            if (this_set->find(addr) != this_set->end())                       
+                return true;
+        } 
+
+        for (int line_id = 0; line_id < end_id; line_id++) {
+            unordered_set<int64_t> *this_set = hashed_buffer[line_id];
+            if (this_set->find(addr) != this_set->end())                       
+                return true;
+        } 
+    }
+
+    return false;  
+}
+
+
+xt::xarray<int64_t> ReadBuffer::service_reads(xt::xarray<int64_t> incoming_requests_arr_np, xt::xarray<int64_t> incoming_cycles_arr) {
+    // cout << "service_reads" << endl;
+    if (!active_buf_full_flag) {
+        int64_t start_cycle = incoming_cycles_arr(0);
+        prefetch_active_buffer(start_cycle); 
+    }
+
+    xt::xarray<int64_t> out_cycles_arr = xt::zeros<int64_t>({incoming_requests_arr_np.shape()[0]});
+    int64_t offset = hit_latency;
+
+    for (int64_t i = 0; i < incoming_requests_arr_np.shape()[0]; i++) {
+        int64_t cycle = incoming_cycles_arr(i);
+        xt::xarray<int64_t> request_line = xt::row(incoming_requests_arr_np, i);
+        
+        for (int64_t addr : request_line) {
+            if (addr == -1)
+                continue;
+
+            while (!active_buffer_hit(addr)) {
+                // cout << "miss at " << addr << endl;
+                // if (addr > 20000000 && addr < 21000000)
+                //     cout << "L1 miss addr " << addr << endl;
+                new_prefetch();
+                int64_t potential_stall_cycles = last_prefect_cycle - (cycle + offset);
+                offset += potential_stall_cycles;
+            }      
+        }
+        out_cycles_arr(i) = incoming_cycles_arr(i) + offset;
+    }
+
+    return out_cycles_arr;
+}
+
+void ReadBuffer::prefetch_active_buffer(int64_t start_cycle) {
+    int64_t num_lines = (active_buf_size + req_gen_bandwidth - 1) / req_gen_bandwidth;
+    
+    if (num_lines >= fetch_matrix.shape()[0]) {
+        num_lines = fetch_matrix.shape()[0];
+    }
+        
+    int64_t requested_data_size = num_lines * req_gen_bandwidth;
+    num_access += requested_data_size;
+
+    int64_t start_idx = 0;
+    int64_t end_idx = num_lines;
+
+    xt::xarray<int64_t> prefetch_requests = xt::view(fetch_matrix, xt::range(start_idx, end_idx), xt::all());
+
+    int64_t next_col_prefetch_idx = 0;
+    if (requested_data_size > active_buf_size) {
+        int64_t valid_cols = active_buf_size % req_gen_bandwidth;
+        int64_t row = end_idx - 1;
+        next_col_prefetch_idx = valid_cols;
+        for (int64_t col = valid_cols; col < req_gen_bandwidth; col++)
+            prefetch_requests(row, col) = -1;
+    }
+            
+    xt::xarray<int64_t> cycles_arr = xt::zeros<int64_t>({num_lines});
+    for (int64_t i = 0; i < num_lines; i++) {
+        cycles_arr(i) = -1 * (num_lines - start_cycle - (i - llc->get_latency()));
+    }
+
+    xt::xarray<int64_t> response_cycles_arr = llc->service_reads(prefetch_requests, cycles_arr);
+
+    last_prefect_cycle = response_cycles_arr(-1);
+
+    trace_valid = true;
+
+    int64_t active_buf_start_line_id = 0;
+    int64_t active_buf_end_line_id = num_active_buf_lines;
+    active_buffer_set_limits = {active_buf_start_line_id, active_buf_end_line_id};
+
+    int64_t prefetch_buf_start_line_id = active_buf_end_line_id;
+    int64_t prefetch_buf_end_line_id = prefetch_buf_start_line_id + num_prefetch_buf_lines;
+    prefetch_buffer_set_limits = {prefetch_buf_start_line_id, prefetch_buf_end_line_id};
+
+    active_buf_full_flag = true;
+
+    if (requested_data_size > active_buf_size) 
+        next_line_prefetch_idx = num_lines % fetch_matrix.shape()[0];
+    else
+        next_line_prefetch_idx = (num_lines + 1) % fetch_matrix.shape()[0];
+}
+
+// void ReadBuffer::new_prefetch() {
+//     cout << "new_prefetch" << endl;
+//     int64_t active_start = active_buffer_set_limits.first;
+//     int64_t active_end = active_buffer_set_limits.second;
+
+//     active_start = (active_start + num_prefetch_buf_lines) % num_lines;
+//     active_end = (active_start + num_active_buf_lines) % num_lines;
+//     int64_t prefetch_start = active_end;
+//     int64_t prefetch_end = (prefetch_start + num_prefetch_buf_lines) % num_lines;
+        
+
+//     active_buffer_set_limits = {active_start, active_end};
+//     prefetch_buffer_set_limits = {prefetch_start, prefetch_end};
+    
+//     int64_t start_idx = next_line_prefetch_idx;
+//     int64_t num_lines = (prefetch_buf_size + req_gen_bandwidth - 1) / req_gen_bandwidth;
+//     int64_t end_idx = start_idx + num_lines;
+//     int64_t requested_data_size = num_lines * req_gen_bandwidth;
+//     num_access += requested_data_size;
+
+//     xt::xarray<int64_t> prefetch_requests;
+
+//     if (end_idx > fetch_matrix.shape()[0]) {
+//         int64_t last_idx = fetch_matrix.shape()[0];
+//         prefetch_requests = xt::view(fetch_matrix, xt::range(start_idx, -1), xt::all());
+//         int64_t new_end_idx = min(end_idx - last_idx, start_idx);
+
+//         xt::xarray<int64_t> new_end_fetch_matrix = xt::view(fetch_matrix, xt::range(0, new_end_idx), xt::all());
+//         prefetch_requests = xt::concatenate(xtuple(prefetch_requests, new_end_fetch_matrix), 0);
+//     } else {
+//         prefetch_requests = xt::view(fetch_matrix, xt::range(start_idx, end_idx), xt::all());
+//     }
+
+//     for (int64_t i = 0; i < next_col_prefetch_idx; i++) {
+//         prefetch_requests(0, i) = -1;
+//     }
+        
+//     if (requested_data_size > active_buf_size) {
+//         int64_t valid_cols = active_buf_size % req_gen_bandwidth;
+//         int64_t row = prefetch_requests.shape()[0] - 1;
+//         for (int64_t col = valid_cols; col < req_gen_bandwidth; col++)
+//             prefetch_requests(row, col) = -1;
+//     }
+
+//     // cout << "set prefetch_requests" << endl;
+            
+//     xt::xarray<int64_t> cycles_arr = xt::zeros<int64_t>({num_lines});
+//     for (int i = 0; i < cycles_arr.shape()[0]; i++)
+//         cycles_arr(i) = last_prefect_cycle + i + 1;
+
+//     // cout << "before llc->service_reads" << endl;
+
+    
+//     cout << "fetch index is " << start_idx << ", " << end_idx << endl;
+//     cout << "fetch_matrix.shape is " << fetch_matrix.shape()[0] << ", " << fetch_matrix.shape()[1] << endl;
+//     cout << "prefetch_requests.shape is " << prefetch_requests.shape()[0] << ", " << prefetch_requests.shape()[1] << endl;
+    
+//     xt::xarray<int64_t> response_cycles_arr = llc->service_reads(prefetch_requests, cycles_arr);
+    
+//     last_prefect_cycle = response_cycles_arr(-1);
+
+//     if (requested_data_size > active_buf_size)
+//         next_line_prefetch_idx = (next_line_prefetch_idx + num_lines) % fetch_matrix.shape()[0];
+//     else
+//         next_line_prefetch_idx = (next_line_prefetch_idx + num_lines + 1) % fetch_matrix.shape()[1];
+// }
+
+void ReadBuffer::new_prefetch() {
+    cout << "new_prefetch" << endl;
+    int64_t active_start = active_buffer_set_limits.first;
+    int64_t active_end = active_buffer_set_limits.second;
+
+    active_start = (active_start + num_prefetch_buf_lines) % num_lines;
+    active_end = (active_start + num_active_buf_lines) % num_lines;
+    int64_t prefetch_start = active_end;
+    int64_t prefetch_end = (prefetch_start + num_prefetch_buf_lines) % num_lines;
+        
+
+    active_buffer_set_limits = {active_start, active_end};
+    prefetch_buffer_set_limits = {prefetch_start, prefetch_end};
+    
+    int64_t start_idx = prefetch_start;
+    int64_t num_lines = (prefetch_buf_size + req_gen_bandwidth - 1) / req_gen_bandwidth;
+    int64_t end_idx = start_idx + num_lines;
+    int64_t requested_data_size = num_lines * req_gen_bandwidth;
+    num_access += requested_data_size;
+
+    xt::xarray<int64_t> prefetch_requests;
+
+    if (end_idx > hashed_buffer.size()) {
+        int64_t last_idx = fetch_matrix.shape()[0];
+        prefetch_requests = xt::view(fetch_matrix, xt::range(start_idx, -1), xt::all());
+        int64_t new_end_idx = min(end_idx - last_idx, start_idx);
+
+        xt::xarray<int64_t> new_end_fetch_matrix = xt::view(fetch_matrix, xt::range(0, new_end_idx), xt::all());
+        prefetch_requests = xt::concatenate(xtuple(prefetch_requests, new_end_fetch_matrix), 0);
+    } else {
+        prefetch_requests = xt::view(fetch_matrix, xt::range(start_idx, end_idx), xt::all());
+    }
+
+    if (end_idx < start_idx) {
+        for (int line_id = start_idx; line_id < end_idx; line_id++) {
+            unordered_set<int64_t> *this_set = hashed_buffer[line_id];
+            last_prefect_cycle = llc->service_read(this_set, last_prefect_cycle + 1);
+        }        
+    } else {
+        for (int line_id = start_idx; line_id < num_lines; line_id++) {
+            unordered_set<int64_t> *this_set = hashed_buffer[line_id];
+            last_prefect_cycle = llc->service_read(this_set, last_prefect_cycle + 1);
+        } 
+
+        for (int line_id = 0; line_id < end_idx; line_id++) {
+            unordered_set<int64_t> *this_set = hashed_buffer[line_id];
+            last_prefect_cycle = llc->service_read(this_set, last_prefect_cycle + 1);
+        } 
+    }
+}
+
+#endif

@@ -1,0 +1,25 @@
+Layer name,Layer Type,IFMAP Height,IFMAP Width,Filter Height,Filter Width,Channels,Num Filter,Stride Height,Stride Width,IFMAP Source,Filter Source,PE,Dataflow
+In_Attn_Xmap,0,1,8,1,1,4096,4096,1,1,-1,-1,0,os
+In_Attn_Kmap,0,1,8,1,1,4096,4096,1,1,-1,-1,0,os
+In_Attn_Vmap,0,1,8,1,1,4096,4096,1,1,-1,-1,0,os
+In_Attn_XxK',0,1,8,1,1,4096,8,1,1,0,1,0,os
+In_Attn_SFMXxV,0,1,8,1,1,8,4096,1,1,2,3,0,ws
+In_Attn_Concat_map,1,1,8,1,1,4096,4096,1,1,4,-1,0,os
+In_FFN1,0,1,8,1,1,4096,4096,1,1,5,-1,0,os
+In_FFN2,0,1,8,1,1,4096,8,1,1,6,-1,0,os
+Out1_Attn_Xmap,0,1,4,1,1,4096,4096,1,1,7,-1,0,os
+Out1_Attn_Kmap,0,1,4,1,1,4096,4096,1,1,-1,-1,0,os
+Out1_Attn_Vmap,0,1,4,1,1,4096,4096,1,1,-1,-1,0,os
+Out1_Attn_XxK',0,1,4,1,1,4096,4,1,1,1,9,0,os
+Out1_Attn_SFMXxV,0,1,4,1,1,4,4096,1,1,10,11,0,ws
+Out1_Attn_Concat_map,1,1,4,1,1,4096,4096,1,1,12,-1,0,os
+Out1_FFN1,0,1,4,1,1,4096,4096,1,1,13,-1,0,os
+Out1_FFN2,0,1,4,1,1,4096,4,1,1,14,-1,0,os
+Out2_Attn_Xmap,0,1,4,1,1,4096,4096,1,1,7,-1,0,os
+Out2_Attn_Kmap,0,1,4,1,1,4096,4096,1,1,15,-1,0,os
+Out2_Attn_Vmap,0,1,4,1,1,4096,4096,1,1,-1,-1,0,os
+Out2_Attn_XxK',0,1,4,1,1,4096,4,1,1,16,17,0,os
+Out2_Attn_SFMXxV,0,1,4,1,1,4,4096,1,1,18,19,0,ws
+Out2_Attn_Concat_map,1,1,4,1,1,4096,4096,1,1,20,-1,0,os
+Out2_FFN1,0,1,4,1,1,4096,4096,1,1,21,-1,0,os
+Out2_FFN2,0,1,4,1,1,4096,4,1,1,22,-1,0,os

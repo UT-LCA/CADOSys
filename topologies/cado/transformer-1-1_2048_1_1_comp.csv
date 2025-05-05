@@ -1,0 +1,9 @@
+Layer name,Layer Type,IFMAP Height,IFMAP Width,Filter Height,Filter Width,Channels,Num Filter,Stride Height,Stride Width,IFMAP Source,Filter Source,PE,Dataflow
+Attn_Xmap,0,1,1,1,1,4096,4096,1,1,-1,-1,0,ws
+Attn_Kmap,0,1,1,1,1,4096,4096,1,1,-1,-1,0,ws
+Attn_Vmap,0,1,1,1,1,4096,4096,1,1,-1,-1,0,ws
+Attn_XxK',0,1,1,1,1,4096,1,1,1,0,1,0,ws
+Attn_SFMXxV,0,1,1,1,1,1,4096,1,1,2,3,0,ws
+Attn_Concat_map,1,1,1,1,1,4096,4096,1,1,4,-1,0,ws
+FFN1,0,1,1,1,1,4096,4096,1,1,5,-1,0,ws
+FFN2,0,1,1,1,1,4096,1,1,1,6,-1,0,ws
